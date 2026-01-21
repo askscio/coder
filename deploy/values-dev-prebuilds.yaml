@@ -1,0 +1,61 @@
+# Helm values for Coder with dev prebuilds enabled.
+#
+# Usage:
+#   helm upgrade --install coder ./helm/coder \
+#     -n coder --create-namespace \
+#     -f deploy/values-dev-prebuilds.yaml
+#
+# Make sure to update the image repo/tag to match your built image.
+
+coder:
+  # Custom image with dev prebuilds support.
+  image:
+    # Update this to your container registry.
+    repo: "ghcr.io/rahul-roy-glean/coder"
+    tag: "dev-prebuilds"
+    pullPolicy: Always
+
+  # Environment variables to enable dev prebuilds and disable telemetry.
+  env:
+    # Enable prebuilds development mode (required for prebuilds without license).
+    - name: CODER_DEV_PREBUILDS
+      value: "true"
+
+    # Disable telemetry to Coder.
+    - name: CODER_TELEMETRY_ENABLE
+      value: "false"
+
+    # Access URL - update this to your actual Coder URL.
+    # - name: CODER_ACCESS_URL
+    #   value: "https://coder.example.com"
+
+    # Database connection - uncomment and configure for production.
+    # - name: CODER_PG_CONNECTION_URL
+    #   valueFrom:
+    #     secretKeyRef:
+    #       name: coder-db-url
+    #       key: url
+
+    # Optional: Configure prebuilds settings.
+    # - name: CODER_PREBUILDS_RECONCILIATION_INTERVAL
+    #   value: "1m"
+
+  # Image pull secrets if using a private registry.
+  # image:
+  #   pullSecrets:
+  #     - name: ghcr-pull-secret
+
+  # Service configuration.
+  service:
+    type: LoadBalancer
+    # For local development, you might want to use NodePort instead:
+    # type: NodePort
+
+  # Resource limits (adjust based on your cluster).
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2048Mi
