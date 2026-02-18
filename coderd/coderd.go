@@ -71,6 +71,7 @@ import (
 	"github.com/coder/coder/v2/coderd/portsharing"
 	"github.com/coder/coder/v2/coderd/pproflabel"
 	"github.com/coder/coder/v2/coderd/prebuilds"
+	"github.com/coder/coder/v2/coderd/prebuilds/devmode"
 	"github.com/coder/coder/v2/coderd/prometheusmetrics"
 	"github.com/coder/coder/v2/coderd/provisionerdserver"
 	"github.com/coder/coder/v2/coderd/proxyhealth"
@@ -638,8 +639,37 @@ func New(options *Options) *API {
 	f := appearance.NewDefaultFetcher(api.DeploymentValues.DocsURL.String())
 	api.AppearanceFetcher.Store(&f)
 	api.PortSharer.Store(&portsharing.DefaultPortSharer)
-	api.PrebuildsClaimer.Store(&prebuilds.DefaultClaimer)
-	api.PrebuildsReconciler.Store(&prebuilds.DefaultReconciler)
+
+	// Check if development mode for prebuilds is enabled.
+	// Set CODER_DEV_PREBUILDS=true to enable prebuilds without a license.
+	if prebuilds.DevModeEnabled() {
+		options.Logger.Warn(ctx, "prebuilds development mode enabled - this is for testing only")
+
+		// Create claimer.
+		devClaimer := prebuilds.Claimer(prebuilds.NewDevClaimer(options.Database))
+		api.PrebuildsClaimer.Store(&devClaimer)
+
+		// Create full reconciler with automatic pool management.
+		devReconciler := prebuilds.ReconciliationOrchestrator(devmode.NewDevStoreReconciler(
+			options.Database,
+			options.Pubsub,
+			api.FileCache,
+			options.DeploymentValues.Prebuilds,
+			options.Logger.Named("prebuilds"),
+			quartz.NewReal(),
+			options.PrometheusRegistry,
+			options.NotificationsEnqueuer,
+			api.BuildUsageChecker,
+			options.TracerProvider,
+		))
+		api.PrebuildsReconciler.Store(&devReconciler)
+
+		// Start the reconciler in the background.
+		pproflabel.Go(ctx, pproflabel.Service(pproflabel.ServicePrebuildReconciler), (*api.PrebuildsReconciler.Load()).Run)
+	} else {
+		api.PrebuildsClaimer.Store(&prebuilds.DefaultClaimer)
+		api.PrebuildsReconciler.Store(&prebuilds.DefaultReconciler)
+	}
 	buildInfo := codersdk.BuildInfoResponse{
 		ExternalURL:           buildinfo.ExternalURL(),
 		Version:               buildinfo.Version(),
