@@ -16,6 +16,7 @@ import (
 
 	agplcoderd "github.com/coder/coder/v2/coderd"
 	"github.com/coder/coder/v2/coderd/database"
+	agpldormancy "github.com/coder/coder/v2/coderd/dormancy"
 	"github.com/coder/coder/v2/cryptorand"
 	"github.com/coder/coder/v2/enterprise/aibridged"
 	"github.com/coder/coder/v2/enterprise/audit"
@@ -97,8 +98,12 @@ func (r *RootCmd) Server(_ func()) *serpent.Command {
 			ProxyHealthInterval:       options.DeploymentValues.ProxyHealthStatusInterval.Value(),
 			DefaultQuietHoursSchedule: options.DeploymentValues.UserQuietHoursSchedule.DefaultSchedule.Value(),
 			ProvisionerDaemonPSK:      options.DeploymentValues.Provisioner.DaemonPSK.Value(),
+		}
 
-			CheckInactiveUsersCancelFunc: dormancy.CheckInactiveUsers(ctx, options.Logger, quartz.NewReal(), options.Database, options.Auditor),
+		// Only start enterprise dormancy if dev mode is not enabled.
+		// If dev mode is enabled, the AGPL version will start it.
+		if !agpldormancy.DevModeEnabled() {
+			o.CheckInactiveUsersCancelFunc = dormancy.CheckInactiveUsers(ctx, options.Logger, quartz.NewReal(), options.Database, options.Auditor)
 		}
 
 		if encKeys := options.DeploymentValues.ExternalTokenEncryptionKeys.Value(); len(encKeys) != 0 {

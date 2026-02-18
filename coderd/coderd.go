@@ -56,6 +56,7 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbrollup"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/database/pubsub"
+	"github.com/coder/coder/v2/coderd/dormancy"
 	"github.com/coder/coder/v2/coderd/entitlements"
 	"github.com/coder/coder/v2/coderd/externalauth"
 	"github.com/coder/coder/v2/coderd/files"
@@ -671,6 +672,15 @@ func New(options *Options) *API {
 	} else {
 		api.PrebuildsClaimer.Store(&prebuilds.DefaultClaimer)
 		api.PrebuildsReconciler.Store(&prebuilds.DefaultReconciler)
+	}
+
+	// Check if development mode for dormancy is enabled.
+	// Set CODER_DEV_DORMANCY=true to enable dormancy without a license.
+	if dormancy.DevModeEnabled() {
+		options.Logger.Warn(ctx, "dormancy development mode enabled - this is for testing only")
+
+		// Start the dormancy checker in the background.
+		api.DormancyCancelFunc = dormancy.CheckInactiveUsers(ctx, options.Logger, quartz.NewReal(), options.Database, options.Auditor)
 	}
 	buildInfo := codersdk.BuildInfoResponse{
 		ExternalURL:           buildinfo.ExternalURL(),
@@ -1885,6 +1895,9 @@ type API struct {
 	FileCache           *files.Cache
 	PrebuildsClaimer    atomic.Pointer[prebuilds.Claimer]
 	PrebuildsReconciler atomic.Pointer[prebuilds.ReconciliationOrchestrator]
+	// DormancyCancelFunc is a function that cancels the dormancy checker job.
+	// This is set when dormancy development mode is enabled.
+	DormancyCancelFunc func()
 	// BuildUsageChecker is a pointer as it's passed around to multiple
 	// components.
 	BuildUsageChecker *atomic.Pointer[wsbuilder.UsageChecker]
@@ -1970,6 +1983,9 @@ func (api *API) Close() error {
 	_ = api.agentProvider.Close()
 	if api.derpCloseFunc != nil {
 		api.derpCloseFunc()
+	}
+	if api.DormancyCancelFunc != nil {
+		api.DormancyCancelFunc()
 	}
 	// The coordinator should be closed after the agent provider, and the DERP
 	// handler.
