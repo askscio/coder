@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +23,6 @@ import (
 	"cdr.dev/slog/v3/sloggers/slogtest"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
-	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbfake"
 	"github.com/coder/coder/v2/coderd/database/dbgen"
@@ -1643,6 +1644,53 @@ func TestAcquireProvisionerJob(t *testing.T) {
 			require.NoError(t, err, "mark job %d/%d as complete", idx+1, numJobs)
 		}
 	})
+
+	t.Run("SkipsCanceledPendingJobs", func(t *testing.T) {
+		t.Parallel()
+		var (
+			db, _ = dbtestutil.NewDB(t)
+			ctx   = testutil.Context(t, testutil.WaitMedium)
+			org   = dbgen.Organization(t, db, database.Organization{})
+			now   = dbtime.Now()
+		)
+
+		// Insert a pending job (started_at is NULL).
+		job, err := db.InsertProvisionerJob(ctx, database.InsertProvisionerJobParams{
+			ID:             uuid.New(),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			InitiatorID:    uuid.New(),
+			OrganizationID: org.ID,
+			Provisioner:    database.ProvisionerTypeEcho,
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			StorageMethod:  database.ProvisionerStorageMethodFile,
+			FileID:         uuid.New(),
+			Input:          json.RawMessage(`{}`),
+			Tags:           database.StringMap{},
+			TraceMetadata:  pqtype.NullRawMessage{},
+		})
+		require.NoError(t, err)
+
+		// Cancel it while still pending. In production (workspacebuilds.go), canceling
+		// a pending build sets completed_at but leaves started_at NULL since no
+		// provisioner ever started the job.
+		err = db.UpdateProvisionerJobWithCancelByID(ctx, database.UpdateProvisionerJobWithCancelByIDParams{
+			ID:          job.ID,
+			CanceledAt:  sql.NullTime{Time: now, Valid: true},
+			CompletedAt: sql.NullTime{Time: now, Valid: true},
+		})
+		require.NoError(t, err)
+
+		// AcquireProvisionerJob should skip this job since it's already completed.
+		_, err = db.AcquireProvisionerJob(ctx, database.AcquireProvisionerJobParams{
+			OrganizationID:  org.ID,
+			StartedAt:       sql.NullTime{Time: now, Valid: true},
+			WorkerID:        uuid.NullUUID{UUID: uuid.New(), Valid: true},
+			Types:           []database.ProvisionerType{database.ProvisionerTypeEcho},
+			ProvisionerTags: json.RawMessage(`{}`),
+		})
+		require.ErrorIs(t, err, sql.ErrNoRows)
+	})
 }
 
 func TestUserLastSeenFilter(t *testing.T) {
@@ -1973,8 +2021,8 @@ func TestWorkspaceQuotas(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		require.ElementsMatch(t, db2sdk.List(everyoneMembers, groupMemberIDs),
-			db2sdk.List([]database.OrganizationMember{memOne, memTwo}, orgMemberIDs))
+		require.ElementsMatch(t, slice.List(everyoneMembers, groupMemberIDs),
+			slice.List([]database.OrganizationMember{memOne, memTwo}, orgMemberIDs))
 
 		// Check the quota is correct.
 		allowance, err := db.GetQuotaAllowanceForUser(ctx, database.GetQuotaAllowanceForUserParams{
@@ -2155,7 +2203,7 @@ func TestReadCustomRoles(t *testing.T) {
 		{
 			Name: "AllRolesByLookup",
 			Params: database.CustomRolesParams{
-				LookupRoles: db2sdk.List(allRoles, roleToLookup),
+				LookupRoles: slice.List(allRoles, roleToLookup),
 			},
 			Match: func(role database.CustomRole) bool {
 				return true
@@ -2221,8 +2269,8 @@ func TestReadCustomRoles(t *testing.T) {
 				}
 			}
 
-			a := db2sdk.List(filtered, normalizedRoleName)
-			b := db2sdk.List(found, normalizedRoleName)
+			a := slice.List(filtered, normalizedRoleName)
+			b := slice.List(found, normalizedRoleName)
 			require.Equal(t, a, b)
 		})
 	}
@@ -4211,7 +4259,7 @@ func TestGroupRemovalTrigger(t *testing.T) {
 	require.ElementsMatch(t, []uuid.UUID{
 		orgA.ID, orgB.ID, // Everyone groups
 		groupA1.ID, groupA2.ID, groupB1.ID, groupB2.ID, // Org groups
-	}, db2sdk.List(userGroups, onlyGroupIDs))
+	}, slice.List(userGroups, onlyGroupIDs))
 
 	// Remove the user from org A
 	err = db.DeleteOrganizationMember(ctx, database.DeleteOrganizationMemberParams{
@@ -4228,7 +4276,7 @@ func TestGroupRemovalTrigger(t *testing.T) {
 	require.ElementsMatch(t, []uuid.UUID{
 		orgB.ID,                // Everyone group
 		groupB1.ID, groupB2.ID, // Org groups
-	}, db2sdk.List(userGroups, onlyGroupIDs))
+	}, slice.List(userGroups, onlyGroupIDs))
 
 	// Verify extra user is unchanged
 	extraUserGroups, err := db.GetGroups(ctx, database.GetGroupsParams{
@@ -4238,7 +4286,7 @@ func TestGroupRemovalTrigger(t *testing.T) {
 	require.ElementsMatch(t, []uuid.UUID{
 		orgA.ID, orgB.ID, // Everyone groups
 		groupA1.ID, groupA2.ID, groupB1.ID, groupB2.ID, // Org groups
-	}, db2sdk.List(extraUserGroups, onlyGroupIDs))
+	}, slice.List(extraUserGroups, onlyGroupIDs))
 }
 
 func TestGetUserStatusCounts(t *testing.T) {
@@ -6717,6 +6765,65 @@ func TestWorkspaceBuildDeadlineConstraint(t *testing.T) {
 	}
 }
 
+func TestWorkspaceACLObjectConstraint(t *testing.T) {
+	t.Parallel()
+
+	db, _ := dbtestutil.NewDB(t)
+	org := dbgen.Organization(t, db, database.Organization{})
+	user := dbgen.User(t, db, database.User{})
+	template := dbgen.Template(t, db, database.Template{
+		CreatedBy:      user.ID,
+		OrganizationID: org.ID,
+	})
+	workspace := dbgen.Workspace(t, db, database.WorkspaceTable{
+		OwnerID:    user.ID,
+		TemplateID: template.ID,
+		Deleted:    false,
+	})
+
+	t.Run("GroupACLNull", func(t *testing.T) {
+		t.Parallel()
+
+		var nilACL database.WorkspaceACL
+
+		ctx := testutil.Context(t, testutil.WaitLong)
+		err := db.UpdateWorkspaceACLByID(ctx, database.UpdateWorkspaceACLByIDParams{
+			ID:       workspace.ID,
+			GroupACL: nilACL,
+			UserACL:  database.WorkspaceACL{},
+		})
+		require.Error(t, err)
+		require.True(t, database.IsCheckViolation(err, database.CheckGroupAclIsObject))
+	})
+
+	t.Run("UserACLNull", func(t *testing.T) {
+		t.Parallel()
+
+		var nilACL database.WorkspaceACL
+
+		ctx := testutil.Context(t, testutil.WaitLong)
+		err := db.UpdateWorkspaceACLByID(ctx, database.UpdateWorkspaceACLByIDParams{
+			ID:       workspace.ID,
+			GroupACL: database.WorkspaceACL{},
+			UserACL:  nilACL,
+		})
+		require.Error(t, err)
+		require.True(t, database.IsCheckViolation(err, database.CheckUserAclIsObject))
+	})
+
+	t.Run("ValidEmptyObjects", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t, testutil.WaitLong)
+		err := db.UpdateWorkspaceACLByID(ctx, database.UpdateWorkspaceACLByIDParams{
+			ID:       workspace.ID,
+			GroupACL: database.WorkspaceACL{},
+			UserACL:  database.WorkspaceACL{},
+		})
+		require.NoError(t, err)
+	})
+}
+
 // TestGetLatestWorkspaceBuildsByWorkspaceIDs populates the database with
 // workspaces and builds. It then tests that
 // GetLatestWorkspaceBuildsByWorkspaceIDs returns the latest build for some
@@ -7045,8 +7152,8 @@ func TestTasksWithStatusView(t *testing.T) {
 			name:                      "PendingStart",
 			buildStatus:               database.ProvisionerJobStatusPending,
 			buildTransition:           database.WorkspaceTransitionStart,
-			expectedStatus:            database.TaskStatusInitializing,
-			description:               "Workspace build is starting (pending)",
+			expectedStatus:            database.TaskStatusPending,
+			description:               "Workspace build pending (not yet picked up by provisioner)",
 			expectBuildNumberValid:    true,
 			expectBuildNumber:         1,
 			expectWorkspaceAgentValid: false,
@@ -7963,12 +8070,15 @@ func TestUpdateAIBridgeInterceptionEnded(t *testing.T) {
 				ID:          uid,
 				InitiatorID: user.ID,
 				Metadata:    json.RawMessage("{}"),
+				Client:      sql.NullString{String: "client", Valid: true},
 			}
 
 			intc, err := db.InsertAIBridgeInterception(ctx, insertParams)
 			require.NoError(t, err)
 			require.Equal(t, uid, intc.ID)
 			require.False(t, intc.EndedAt.Valid)
+			require.True(t, intc.Client.Valid)
+			require.Equal(t, "client", intc.Client.String)
 			interceptions = append(interceptions, intc)
 		}
 
@@ -8076,4 +8186,509 @@ func TestDeleteExpiredAPIKeys(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, remaining, len(unexpiredTimes))
+}
+
+func TestGetAuthenticatedWorkspaceAgentAndBuildByAuthToken_ShutdownScripts(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.SkipNow()
+	}
+
+	sqlDB := testSQLDB(t)
+	err := migrations.Up(sqlDB)
+	require.NoError(t, err)
+	db := database.New(sqlDB)
+
+	org := dbgen.Organization(t, db, database.Organization{})
+	owner := dbgen.User(t, db, database.User{})
+	tpl := dbgen.Template(t, db, database.Template{
+		OrganizationID: org.ID,
+		CreatedBy:      owner.ID,
+	})
+	ver := dbgen.TemplateVersion(t, db, database.TemplateVersion{
+		TemplateID: uuid.NullUUID{
+			UUID:  tpl.ID,
+			Valid: true,
+		},
+		OrganizationID: tpl.OrganizationID,
+		CreatedBy:      owner.ID,
+	})
+
+	t.Run("DuringStopBuild", func(t *testing.T) {
+		t.Parallel()
+		ctx := testutil.Context(t, testutil.WaitMedium)
+		workspace := dbgen.Workspace(t, db, database.WorkspaceTable{
+			OwnerID:        owner.ID,
+			OrganizationID: org.ID,
+			TemplateID:     tpl.ID,
+		})
+
+		// Create start build with succeeded job (already completed).
+		startJob := database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+		}
+		setJobStatus(t, database.ProvisionerJobStatusSucceeded, &startJob)
+		startJob = dbgen.ProvisionerJob(t, db, nil, startJob)
+		startResource := dbgen.WorkspaceResource(t, db, database.WorkspaceResource{
+			JobID:      startJob.ID,
+			Transition: database.WorkspaceTransitionStart,
+		})
+		startBuild := dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       1,
+			Transition:        database.WorkspaceTransitionStart,
+			InitiatorID:       owner.ID,
+			JobID:             startJob.ID,
+		})
+		agent := dbgen.WorkspaceAgent(t, db, database.WorkspaceAgent{
+			ResourceID: startResource.ID,
+		})
+
+		// Create stop build (becomes latest).
+		stopJob := dbgen.ProvisionerJob(t, db, nil, database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+			JobStatus:      database.ProvisionerJobStatusRunning,
+		})
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       2,
+			Transition:        database.WorkspaceTransitionStop,
+			InitiatorID:       owner.ID,
+			JobID:             stopJob.ID,
+		})
+
+		// Agent should still authenticate during stop build execution.
+		row, err := db.GetAuthenticatedWorkspaceAgentAndBuildByAuthToken(dbauthz.AsSystemRestricted(ctx), agent.AuthToken)
+		require.NoError(t, err, "agent should authenticate during stop build execution")
+		require.Equal(t, agent.ID, row.WorkspaceAgent.ID)
+		require.Equal(t, startBuild.ID, row.WorkspaceBuild.ID, "should return start build, not stop build")
+	})
+
+	t.Run("AfterStopJobCompletes", func(t *testing.T) {
+		t.Parallel()
+		ctx := testutil.Context(t, testutil.WaitMedium)
+		workspace := dbgen.Workspace(t, db, database.WorkspaceTable{
+			OwnerID:        owner.ID,
+			OrganizationID: org.ID,
+			TemplateID:     tpl.ID,
+		})
+
+		// Create start build with completed job.
+		startJob := database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+		}
+		setJobStatus(t, database.ProvisionerJobStatusSucceeded, &startJob)
+		startJob = dbgen.ProvisionerJob(t, db, nil, startJob)
+
+		startResource := dbgen.WorkspaceResource(t, db, database.WorkspaceResource{
+			JobID:      startJob.ID,
+			Transition: database.WorkspaceTransitionStart,
+		})
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       1,
+			Transition:        database.WorkspaceTransitionStart,
+			InitiatorID:       owner.ID,
+			JobID:             startJob.ID,
+		})
+		agent := dbgen.WorkspaceAgent(t, db, database.WorkspaceAgent{
+			ResourceID: startResource.ID,
+		})
+
+		// Create stop build (becomes latest) with completed job.
+		stopJob := database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+		}
+		setJobStatus(t, database.ProvisionerJobStatusSucceeded, &stopJob)
+		stopJob = dbgen.ProvisionerJob(t, db, nil, stopJob)
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       2,
+			Transition:        database.WorkspaceTransitionStop,
+			InitiatorID:       owner.ID,
+			JobID:             stopJob.ID,
+		})
+
+		// Agent should NOT authenticate after stop job completes.
+		_, err := db.GetAuthenticatedWorkspaceAgentAndBuildByAuthToken(dbauthz.AsSystemRestricted(ctx), agent.AuthToken)
+		require.ErrorIs(t, err, sql.ErrNoRows, "agent should not authenticate after stop job completes")
+	})
+
+	t.Run("FailedStartBuild", func(t *testing.T) {
+		t.Parallel()
+		ctx := testutil.Context(t, testutil.WaitMedium)
+		workspace := dbgen.Workspace(t, db, database.WorkspaceTable{
+			OwnerID:        owner.ID,
+			OrganizationID: org.ID,
+			TemplateID:     tpl.ID,
+		})
+
+		// Create START build with FAILED job.
+		startJob := database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+		}
+		setJobStatus(t, database.ProvisionerJobStatusFailed, &startJob)
+		startJob = dbgen.ProvisionerJob(t, db, nil, startJob)
+		startResource := dbgen.WorkspaceResource(t, db, database.WorkspaceResource{
+			JobID:      startJob.ID,
+			Transition: database.WorkspaceTransitionStart,
+		})
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       1,
+			Transition:        database.WorkspaceTransitionStart,
+			InitiatorID:       owner.ID,
+			JobID:             startJob.ID,
+		})
+		agent := dbgen.WorkspaceAgent(t, db, database.WorkspaceAgent{
+			ResourceID: startResource.ID,
+		})
+
+		// Create STOP build with running job.
+		stopJob := dbgen.ProvisionerJob(t, db, nil, database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+			JobStatus:      database.ProvisionerJobStatusRunning,
+		})
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       2,
+			Transition:        database.WorkspaceTransitionStop,
+			InitiatorID:       owner.ID,
+			JobID:             stopJob.ID,
+		})
+
+		// Agent should NOT authenticate (start build failed).
+		_, err := db.GetAuthenticatedWorkspaceAgentAndBuildByAuthToken(dbauthz.AsSystemRestricted(ctx), agent.AuthToken)
+		require.ErrorIs(t, err, sql.ErrNoRows, "agent from failed start build should not authenticate")
+	})
+
+	t.Run("PendingStopBuild", func(t *testing.T) {
+		t.Parallel()
+		ctx := testutil.Context(t, testutil.WaitMedium)
+		workspace := dbgen.Workspace(t, db, database.WorkspaceTable{
+			OwnerID:        owner.ID,
+			OrganizationID: org.ID,
+			TemplateID:     tpl.ID,
+		})
+
+		// Create start build with succeeded job.
+		startJob := database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+		}
+		setJobStatus(t, database.ProvisionerJobStatusSucceeded, &startJob)
+		startJob = dbgen.ProvisionerJob(t, db, nil, startJob)
+		startResource := dbgen.WorkspaceResource(t, db, database.WorkspaceResource{
+			JobID:      startJob.ID,
+			Transition: database.WorkspaceTransitionStart,
+		})
+		startBuild := dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       1,
+			Transition:        database.WorkspaceTransitionStart,
+			InitiatorID:       owner.ID,
+			JobID:             startJob.ID,
+		})
+		agent := dbgen.WorkspaceAgent(t, db, database.WorkspaceAgent{
+			ResourceID: startResource.ID,
+		})
+
+		// Create stop build with pending job (not started yet).
+		stopJob := database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+		}
+		setJobStatus(t, database.ProvisionerJobStatusPending, &stopJob)
+		stopJob = dbgen.ProvisionerJob(t, db, nil, stopJob)
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       2,
+			Transition:        database.WorkspaceTransitionStop,
+			InitiatorID:       owner.ID,
+			JobID:             stopJob.ID,
+		})
+
+		// Agent should authenticate during pending stop build.
+		row, err := db.GetAuthenticatedWorkspaceAgentAndBuildByAuthToken(dbauthz.AsSystemRestricted(ctx), agent.AuthToken)
+		require.NoError(t, err, "agent should authenticate during pending stop build")
+		require.Equal(t, agent.ID, row.WorkspaceAgent.ID)
+		require.Equal(t, startBuild.ID, row.WorkspaceBuild.ID, "should return start build")
+	})
+
+	t.Run("MultipleStartStopCycles", func(t *testing.T) {
+		t.Parallel()
+		ctx := testutil.Context(t, testutil.WaitMedium)
+		workspace := dbgen.Workspace(t, db, database.WorkspaceTable{
+			OwnerID:        owner.ID,
+			OrganizationID: org.ID,
+			TemplateID:     tpl.ID,
+		})
+
+		// Build 1: START (succeeded).
+		startJob1 := database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+		}
+		setJobStatus(t, database.ProvisionerJobStatusSucceeded, &startJob1)
+		startJob1 = dbgen.ProvisionerJob(t, db, nil, startJob1)
+		startResource1 := dbgen.WorkspaceResource(t, db, database.WorkspaceResource{
+			JobID:      startJob1.ID,
+			Transition: database.WorkspaceTransitionStart,
+		})
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       1,
+			Transition:        database.WorkspaceTransitionStart,
+			InitiatorID:       owner.ID,
+			JobID:             startJob1.ID,
+		})
+		agent1 := dbgen.WorkspaceAgent(t, db, database.WorkspaceAgent{
+			ResourceID: startResource1.ID,
+		})
+
+		// Build 2: STOP (succeeded).
+		stopJob1 := database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+		}
+		setJobStatus(t, database.ProvisionerJobStatusSucceeded, &stopJob1)
+		stopJob1 = dbgen.ProvisionerJob(t, db, nil, stopJob1)
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       2,
+			Transition:        database.WorkspaceTransitionStop,
+			InitiatorID:       owner.ID,
+			JobID:             stopJob1.ID,
+		})
+
+		// Build 3: START (succeeded).
+		startJob2 := database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+		}
+		setJobStatus(t, database.ProvisionerJobStatusSucceeded, &startJob2)
+		startJob2 = dbgen.ProvisionerJob(t, db, nil, startJob2)
+		startResource2 := dbgen.WorkspaceResource(t, db, database.WorkspaceResource{
+			JobID:      startJob2.ID,
+			Transition: database.WorkspaceTransitionStart,
+		})
+		startBuild2 := dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       3,
+			Transition:        database.WorkspaceTransitionStart,
+			InitiatorID:       owner.ID,
+			JobID:             startJob2.ID,
+		})
+		agent2 := dbgen.WorkspaceAgent(t, db, database.WorkspaceAgent{
+			ResourceID: startResource2.ID,
+		})
+
+		// Build 4: STOP (running).
+		stopJob2 := dbgen.ProvisionerJob(t, db, nil, database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+			JobStatus:      database.ProvisionerJobStatusRunning,
+		})
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       4,
+			Transition:        database.WorkspaceTransitionStop,
+			InitiatorID:       owner.ID,
+			JobID:             stopJob2.ID,
+		})
+
+		// Agent from build 3 should authenticate.
+		row, err := db.GetAuthenticatedWorkspaceAgentAndBuildByAuthToken(dbauthz.AsSystemRestricted(ctx), agent2.AuthToken)
+		require.NoError(t, err, "agent from most recent start should authenticate during stop")
+		require.Equal(t, agent2.ID, row.WorkspaceAgent.ID)
+		require.Equal(t, startBuild2.ID, row.WorkspaceBuild.ID)
+
+		// Agent from build 1 should NOT authenticate.
+		_, err = db.GetAuthenticatedWorkspaceAgentAndBuildByAuthToken(dbauthz.AsSystemRestricted(ctx), agent1.AuthToken)
+		require.ErrorIs(t, err, sql.ErrNoRows, "agent from old cycle should not authenticate")
+	})
+
+	t.Run("WrongTransitionType", func(t *testing.T) {
+		t.Parallel()
+		ctx := testutil.Context(t, testutil.WaitMedium)
+		workspace := dbgen.Workspace(t, db, database.WorkspaceTable{
+			OwnerID:        owner.ID,
+			OrganizationID: org.ID,
+			TemplateID:     tpl.ID,
+		})
+
+		// Create first start build.
+		startJob1 := database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+		}
+		setJobStatus(t, database.ProvisionerJobStatusSucceeded, &startJob1)
+		startJob1 = dbgen.ProvisionerJob(t, db, nil, startJob1)
+		startResource1 := dbgen.WorkspaceResource(t, db, database.WorkspaceResource{
+			JobID:      startJob1.ID,
+			Transition: database.WorkspaceTransitionStart,
+		})
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       1,
+			Transition:        database.WorkspaceTransitionStart,
+			InitiatorID:       owner.ID,
+			JobID:             startJob1.ID,
+		})
+		agent1 := dbgen.WorkspaceAgent(t, db, database.WorkspaceAgent{
+			ResourceID: startResource1.ID,
+		})
+
+		// Create another START build as latest (not STOP).
+		startJob2 := dbgen.ProvisionerJob(t, db, nil, database.ProvisionerJob{
+			Type:           database.ProvisionerJobTypeWorkspaceBuild,
+			InitiatorID:    owner.ID,
+			OrganizationID: org.ID,
+			JobStatus:      database.ProvisionerJobStatusRunning,
+		})
+		_ = dbgen.WorkspaceBuild(t, db, database.WorkspaceBuild{
+			WorkspaceID:       workspace.ID,
+			TemplateVersionID: ver.ID,
+			BuildNumber:       2,
+			Transition:        database.WorkspaceTransitionStart,
+			InitiatorID:       owner.ID,
+			JobID:             startJob2.ID,
+		})
+
+		// Agent from build 1 should NOT authenticate (latest is not STOP).
+		_, err := db.GetAuthenticatedWorkspaceAgentAndBuildByAuthToken(dbauthz.AsSystemRestricted(ctx), agent1.AuthToken)
+		require.ErrorIs(t, err, sql.ErrNoRows, "agent should not authenticate when latest build is not STOP")
+	})
+}
+
+// Our `InsertWorkspaceAgentDevcontainers` query should ideally be `[]uuid.NullUUID` but unfortunately
+// sqlc infers it as `[]uuid.UUID`. To ensure we don't insert a `uuid.Nil`, the query inserts NULL when
+// passed with `uuid.Nil`. This test ensures we keep this behavior without regression.
+func TestInsertWorkspaceAgentDevcontainers(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		validSubagent []bool
+	}{
+		{"BothValid", []bool{true, true}},
+		{"FirstValidSecondInvalid", []bool{true, false}},
+		{"FirstInvalidSecondValid", []bool{false, true}},
+		{"BothInvalid", []bool{false, false}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				db, _ = dbtestutil.NewDB(t)
+				org   = dbgen.Organization(t, db, database.Organization{})
+				job   = dbgen.ProvisionerJob(t, db, nil, database.ProvisionerJob{
+					Type:           database.ProvisionerJobTypeTemplateVersionImport,
+					OrganizationID: org.ID,
+				})
+				resource = dbgen.WorkspaceResource(t, db, database.WorkspaceResource{JobID: job.ID})
+				agent    = dbgen.WorkspaceAgent(t, db, database.WorkspaceAgent{ResourceID: resource.ID})
+			)
+
+			ids := make([]uuid.UUID, len(tc.validSubagent))
+			names := make([]string, len(tc.validSubagent))
+			workspaceFolders := make([]string, len(tc.validSubagent))
+			configPaths := make([]string, len(tc.validSubagent))
+			subagentIDs := make([]uuid.UUID, len(tc.validSubagent))
+
+			for i, valid := range tc.validSubagent {
+				ids[i] = uuid.New()
+				names[i] = fmt.Sprintf("test-devcontainer-%d", i)
+				workspaceFolders[i] = fmt.Sprintf("/workspace%d", i)
+				configPaths[i] = fmt.Sprintf("/workspace%d/.devcontainer/devcontainer.json", i)
+
+				if valid {
+					subagentIDs[i] = dbgen.WorkspaceAgent(t, db, database.WorkspaceAgent{
+						ResourceID: resource.ID,
+						ParentID:   uuid.NullUUID{UUID: agent.ID, Valid: true},
+					}).ID
+				} else {
+					subagentIDs[i] = uuid.Nil
+				}
+			}
+
+			ctx := testutil.Context(t, testutil.WaitShort)
+
+			// Given: We insert multiple devcontainer records.
+			devcontainers, err := db.InsertWorkspaceAgentDevcontainers(ctx, database.InsertWorkspaceAgentDevcontainersParams{
+				WorkspaceAgentID: agent.ID,
+				CreatedAt:        dbtime.Now(),
+				ID:               ids,
+				Name:             names,
+				WorkspaceFolder:  workspaceFolders,
+				ConfigPath:       configPaths,
+				SubagentID:       subagentIDs,
+			})
+			require.NoError(t, err)
+			require.Len(t, devcontainers, len(tc.validSubagent))
+
+			// Then: Verify each devcontainer has the correct SubagentID validity.
+			// - When we pass `uuid.Nil`, we get a `uuid.NullUUID{Valid: false}`
+			// - When we pass a valid UUID, we get a `uuid.NullUUID{Valid: true}`
+			for i, valid := range tc.validSubagent {
+				require.Equal(t, valid, devcontainers[i].SubagentID.Valid, "devcontainer %d: subagent_id validity mismatch", i)
+				if valid {
+					require.Equal(t, subagentIDs[i], devcontainers[i].SubagentID.UUID, "devcontainer %d: subagent_id UUID mismatch", i)
+				}
+			}
+
+			// Perform the same check on data returned by
+			// `GetWorkspaceAgentDevcontainersByAgentID` to ensure the fix is at
+			// the data storage layer, instead of just at a query level.
+			fetched, err := db.GetWorkspaceAgentDevcontainersByAgentID(ctx, agent.ID)
+			require.NoError(t, err)
+			require.Len(t, fetched, len(tc.validSubagent))
+
+			// Sort fetched by name to ensure consistent ordering for comparison.
+			slices.SortFunc(fetched, func(a, b database.WorkspaceAgentDevcontainer) int {
+				return strings.Compare(a.Name, b.Name)
+			})
+
+			for i, valid := range tc.validSubagent {
+				require.Equal(t, valid, fetched[i].SubagentID.Valid, "fetched devcontainer %d: subagent_id validity mismatch", i)
+				if valid {
+					require.Equal(t, subagentIDs[i], fetched[i].SubagentID.UUID, "fetched devcontainer %d: subagent_id UUID mismatch", i)
+				}
+			}
+		})
+	}
 }

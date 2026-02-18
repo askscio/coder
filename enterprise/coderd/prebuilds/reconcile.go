@@ -51,16 +51,22 @@ type StoreReconciler struct {
 	buildUsageChecker *atomic.Pointer[wsbuilder.UsageChecker]
 	tracer            trace.Tracer
 
-	cancelFn          context.CancelCauseFunc
-	running           atomic.Bool
-	stopped           atomic.Bool
+	// mu protects the reconciler's lifecycle state.
+	mu       sync.Mutex
+	running  bool
+	stopped  bool
+	cancelFn context.CancelCauseFunc
+
 	done              chan struct{}
 	provisionNotifyCh chan database.ProvisionerJob
+
+	reconciliationConcurrency int
 
 	// Prebuild state metrics
 	metrics *MetricsCollector
 	// Operational metrics
-	reconciliationDuration prometheus.Histogram
+	reconciliationDuration  prometheus.Histogram
+	workspaceBuilderMetrics *wsbuilder.Metrics
 }
 
 var _ prebuilds.ReconciliationOrchestrator = &StoreReconciler{}
@@ -93,20 +99,30 @@ func NewStoreReconciler(store database.Store,
 	notifEnq notifications.Enqueuer,
 	buildUsageChecker *atomic.Pointer[wsbuilder.UsageChecker],
 	tracerProvider trace.TracerProvider,
+	maxDBConnections int,
+	workspaceBuilderMetrics *wsbuilder.Metrics,
 ) *StoreReconciler {
+	reconciliationConcurrency := calculateReconciliationConcurrency(maxDBConnections)
+
+	logger.Debug(context.Background(), "reconciler initialized",
+		slog.F("reconciliation_concurrency", reconciliationConcurrency),
+		slog.F("max_db_connections", maxDBConnections))
+
 	reconciler := &StoreReconciler{
-		store:             store,
-		pubsub:            ps,
-		fileCache:         fileCache,
-		logger:            logger,
-		cfg:               cfg,
-		clock:             clock,
-		registerer:        registerer,
-		notifEnq:          notifEnq,
-		buildUsageChecker: buildUsageChecker,
-		tracer:            tracerProvider.Tracer(tracing.TracerName),
-		done:              make(chan struct{}, 1),
-		provisionNotifyCh: make(chan database.ProvisionerJob, 10),
+		store:                     store,
+		pubsub:                    ps,
+		fileCache:                 fileCache,
+		logger:                    logger,
+		cfg:                       cfg,
+		clock:                     clock,
+		registerer:                registerer,
+		notifEnq:                  notifEnq,
+		buildUsageChecker:         buildUsageChecker,
+		tracer:                    tracerProvider.Tracer(tracing.TracerName),
+		done:                      make(chan struct{}, 1),
+		provisionNotifyCh:         make(chan database.ProvisionerJob, 10),
+		reconciliationConcurrency: reconciliationConcurrency,
+		workspaceBuilderMetrics:   workspaceBuilderMetrics,
 	}
 
 	if registerer != nil {
@@ -129,6 +145,29 @@ func NewStoreReconciler(store database.Store,
 	return reconciler
 }
 
+// calculateReconciliationConcurrency determines the number of concurrent
+// goroutines for preset reconciliation. Each preset may perform multiple
+// database operations (creates/deletes), so we limit concurrency to avoid
+// exhausting the connection pool while maintaining reasonable parallelism.
+//
+// Uses half the pool size, with a minimum of 1 and a maximum of 5.
+// TODO(ssncferreira): If this becomes a bottleneck, consider adding a configuration option.
+func calculateReconciliationConcurrency(maxDBConnections int) int {
+	if maxDBConnections <= 0 {
+		return 1
+	}
+
+	concurrency := maxDBConnections / 2
+	if concurrency < 1 {
+		return 1
+	}
+	if concurrency > 5 {
+		return 5
+	}
+
+	return concurrency
+}
+
 func (c *StoreReconciler) Run(ctx context.Context) {
 	reconciliationInterval := c.cfg.ReconciliationInterval.Value()
 	if reconciliationInterval <= 0 { // avoids a panic
@@ -138,19 +177,35 @@ func (c *StoreReconciler) Run(ctx context.Context) {
 	c.logger.Info(ctx, "starting reconciler",
 		slog.F("interval", reconciliationInterval),
 		slog.F("backoff_interval", c.cfg.ReconciliationBackoffInterval.String()),
-		slog.F("backoff_lookback", c.cfg.ReconciliationBackoffLookback.String()))
+		slog.F("backoff_lookback", c.cfg.ReconciliationBackoffLookback.String()),
+		slog.F("preset_concurrency", c.reconciliationConcurrency))
 
-	var wg sync.WaitGroup
+	// Create a child context that will be canceled when:
+	// 1. The parent context is canceled, OR
+	// 2. c.cancelFn() is called to trigger shutdown
+	// nolint:gocritic // Reconciliation Loop needs Prebuilds Orchestrator permissions.
+	ctx, cancel := context.WithCancelCause(dbauthz.AsPrebuildsOrchestrator(ctx))
+
+	// If the reconciler was already stopped, exit early and release the context.
+	// Otherwise, mark it as running and store the cancel function for shutdown.
+	c.mu.Lock()
+	if c.stopped || c.running {
+		c.mu.Unlock()
+		cancel(nil)
+		return
+	}
+	c.running = true
+	c.cancelFn = cancel
+	c.mu.Unlock()
+
 	ticker := c.clock.NewTicker(reconciliationInterval)
 	defer ticker.Stop()
+	// Wait for all background goroutines to exit before signaling completion.
+	var wg sync.WaitGroup
 	defer func() {
 		wg.Wait()
 		c.done <- struct{}{}
 	}()
-
-	// nolint:gocritic // Reconciliation Loop needs Prebuilds Orchestrator permissions.
-	ctx, cancel := context.WithCancelCause(dbauthz.AsPrebuildsOrchestrator(ctx))
-	c.cancelFn = cancel
 
 	// Start updating metrics in the background.
 	if c.metrics != nil {
@@ -161,11 +216,6 @@ func (c *StoreReconciler) Run(ctx context.Context) {
 		}()
 	}
 
-	// Everything is in place, reconciler can now be considered as running.
-	//
-	// NOTE: without this atomic bool, Stop might race with Run for the c.cancelFn above.
-	c.running.Store(true)
-
 	// Publish provisioning jobs outside of database transactions.
 	// A connection is held while a database transaction is active; PGPubsub also tries to acquire a new connection on
 	// Publish, so we can exhaust available connections.
@@ -173,11 +223,11 @@ func (c *StoreReconciler) Run(ctx context.Context) {
 	// A single worker dequeues from the channel, which should be sufficient.
 	// If any messages are missed due to congestion or errors, provisionerdserver has a backup polling mechanism which
 	// will periodically pick up any queued jobs (see poll(time.Duration) in coderd/provisionerdserver/acquirer.go).
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
-			case <-c.done:
-				return
 			case <-ctx.Done():
 				return
 			case job := <-c.provisionNotifyCh:
@@ -203,7 +253,11 @@ func (c *StoreReconciler) Run(ctx context.Context) {
 			if c.reconciliationDuration != nil {
 				c.reconciliationDuration.Observe(stats.Elapsed.Seconds())
 			}
-			c.logger.Debug(ctx, "reconciliation stats", slog.F("elapsed", stats.Elapsed))
+			c.logger.Info(ctx, "reconciliation stats",
+				slog.F("elapsed", stats.Elapsed),
+				slog.F("presets_total", stats.PresetsTotal),
+				slog.F("presets_reconciled", stats.PresetsReconciled),
+			)
 		case <-ctx.Done():
 			// nolint:gocritic // it's okay to use slog.F() for an error in this case
 			// because we want to differentiate two different types of errors: ctx.Err() and context.Cause()
@@ -218,23 +272,31 @@ func (c *StoreReconciler) Run(ctx context.Context) {
 	}
 }
 
+// Stop triggers reconciler shutdown and waits for it to complete.
+// The ctx parameter provides a timeout, if cleanup doesn't finish within
+// this timeout, Stop() logs an error and returns.
 func (c *StoreReconciler) Stop(ctx context.Context, cause error) {
-	defer c.running.Store(false)
-
 	if cause != nil {
-		c.logger.Error(context.Background(), "stopping reconciler due to an error", slog.Error(cause))
+		c.logger.Info(context.Background(), "stopping reconciler", slog.F("cause", cause.Error()))
 	} else {
-		c.logger.Info(context.Background(), "gracefully stopping reconciler")
+		c.logger.Info(context.Background(), "stopping reconciler")
 	}
 
-	// If previously stopped (Swap returns previous value), then short-circuit.
+	// Mark the reconciler as stopped. If it was already stopped, return early.
+	// If the reconciler is running, we'll proceed to shut it down.
 	//
-	// NOTE: we need to *prospectively* mark this as stopped to prevent Stop being called multiple times and causing problems.
-	if c.stopped.Swap(true) {
+	// NOTE: we need to *prospectively* mark this as stopped to prevent the
+	// reconciler from being stopped multiple times and causing problems.
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
 		return
 	}
+	c.stopped = true
+	running := c.running
+	c.mu.Unlock()
 
-	// Unregister the metrics collector.
+	// Unregister prebuilds state and operational metrics.
 	if c.metrics != nil && c.registerer != nil {
 		if !c.registerer.Unregister(c.metrics) {
 			// The API doesn't allow us to know why the de-registration failed, but it's not very consequential.
@@ -243,19 +305,26 @@ func (c *StoreReconciler) Stop(ctx context.Context, cause error) {
 			// feature again. If the metrics cannot be registered, it'll log an error from NewStoreReconciler.
 			c.logger.Warn(context.Background(), "failed to unregister metrics collector")
 		}
+		if c.reconciliationDuration != nil {
+			if !c.registerer.Unregister(c.reconciliationDuration) {
+				c.logger.Warn(context.Background(), "failed to unregister reconciliation duration histogram")
+			}
+		}
 	}
 
 	// If the reconciler is not running, there's nothing else to do.
-	if !c.running.Load() {
+	if !running {
 		return
 	}
 
+	// Trigger reconciler shutdown by canceling its internal context.
 	if c.cancelFn != nil {
 		c.cancelFn(cause)
 	}
 
+	// Wait for the reconciler to signal that it has fully exited and cleaned up.
 	select {
-	// Give up waiting for control loop to exit.
+	// Timeout: reconciler didn't finish cleanup within the timeout period.
 	case <-ctx.Done():
 		// nolint:gocritic // it's okay to use slog.F() for an error in this case
 		// because we want to differentiate two different types of errors: ctx.Err() and context.Cause()
@@ -265,7 +334,7 @@ func (c *StoreReconciler) Stop(ctx context.Context, cause error) {
 			slog.Error(ctx.Err()),
 			slog.F("cause", context.Cause(ctx)),
 		)
-	// Wait for the control loop to exit.
+	// Happy path: reconciler has successfully exited.
 	case <-c.done:
 		c.logger.Info(context.Background(), "reconciler stopped")
 	}
@@ -351,6 +420,11 @@ func (c *StoreReconciler) ReconcileAll(ctx context.Context) (stats prebuilds.Rec
 		}
 
 		var eg errgroup.Group
+		// Limit concurrency to avoid exhausting the coderd database connection pool.
+		eg.SetLimit(c.reconciliationConcurrency)
+
+		presetsReconciled := 0
+
 		// Reconcile presets in parallel. Each preset in its own goroutine.
 		for _, preset := range snapshot.Presets {
 			ps, err := snapshot.FilterByPreset(preset.ID)
@@ -358,6 +432,15 @@ func (c *StoreReconciler) ReconcileAll(ctx context.Context) (stats prebuilds.Rec
 				logger.Warn(ctx, "failed to find preset snapshot", slog.Error(err), slog.F("preset_id", preset.ID.String()))
 				continue
 			}
+
+			// Performance optimization: Skip presets that won't need any database operations.
+			// This avoids holding a slot in the errgroup limiter, reserving capacity for
+			// presets that actually need database connections.
+			if ps.CanSkipReconciliation() {
+				continue
+			}
+
+			presetsReconciled++
 
 			eg.Go(func() error {
 				// Pass outer context.
@@ -374,6 +457,9 @@ func (c *StoreReconciler) ReconcileAll(ctx context.Context) (stats prebuilds.Rec
 				return nil
 			})
 		}
+
+		stats.PresetsTotal = len(snapshot.Presets)
+		stats.PresetsReconciled = presetsReconciled
 
 		// Release lock only when all preset reconciliation goroutines are finished.
 		return eg.Wait()
@@ -969,7 +1055,8 @@ func (c *StoreReconciler) provision(
 	builder := wsbuilder.New(workspace, transition, *c.buildUsageChecker.Load()).
 		Reason(database.BuildReasonInitiator).
 		Initiator(database.PrebuildsSystemUserID).
-		MarkPrebuild()
+		MarkPrebuild().
+		BuildMetrics(c.workspaceBuilderMetrics)
 
 	if transition != database.WorkspaceTransitionDelete {
 		// We don't specify the version for a delete transition,

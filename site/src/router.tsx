@@ -7,6 +7,7 @@ import {
 	Navigate,
 	Outlet,
 	Route,
+	ScrollRestoration,
 } from "react-router";
 import { Loader } from "./components/Loader/Loader";
 import { RequireAuth } from "./contexts/auth/RequireAuth";
@@ -161,6 +162,12 @@ const ObservabilitySettingsPage = lazy(
 	() =>
 		import(
 			"./pages/DeploymentSettingsPage/ObservabilitySettingsPage/ObservabilitySettingsPage"
+		),
+);
+const AIGovernanceSettingsPage = lazy(
+	() =>
+		import(
+			"./pages/DeploymentSettingsPage/AIGovernanceSettingsPage/AIGovernanceSettingsPage"
 		),
 );
 const ExternalAuthPage = lazy(
@@ -345,10 +352,11 @@ const AIBridgeRequestLogsPage = lazy(
 	() => import("./pages/AIBridgePage/RequestLogsPage/RequestLogsPage"),
 );
 
-const RoutesWithSuspense = () => {
+const GlobalLayout = () => {
 	return (
 		<Suspense fallback={<Loader fullscreen />}>
 			<Outlet />
+			<ScrollRestoration />
 		</Suspense>
 	);
 };
@@ -403,10 +411,7 @@ const groupsRouter = () => {
 
 export const router = createBrowserRouter(
 	createRoutesFromChildren(
-		<Route
-			element={<RoutesWithSuspense />}
-			errorElement={<GlobalErrorBoundary />}
-		>
+		<Route element={<GlobalLayout />} errorElement={<GlobalErrorBoundary />}>
 			<Route path="login" element={<LoginPage />} />
 			<Route path="login/device" element={<LoginOAuthDevicePage />} />
 			<Route path="setup" element={<SetupPage />} />
@@ -490,6 +495,10 @@ export const router = createBrowserRouter(
 							<Route
 								path="observability"
 								element={<ObservabilitySettingsPage />}
+							/>
+							<Route
+								path="ai-governance"
+								element={<AIGovernanceSettingsPage />}
 							/>
 							<Route path="network" element={<NetworkSettingsPage />} />
 							<Route path="userauth" element={<UserAuthSettingsPage />} />

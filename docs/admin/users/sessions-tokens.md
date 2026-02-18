@@ -9,6 +9,21 @@ The [Coder CLI](../../install/cli.md) and
 token to authenticate. To generate a short-lived session token on behalf of your
 account, visit the following URL: `https://coder.example.com/cli-auth`
 
+### Retrieve the current session token
+
+If you're already logged in with the CLI, you can retrieve your current session
+token for use in scripts and automation:
+
+```sh
+coder login token
+```
+
+This is useful for passing your session token to other tools:
+
+```sh
+export CODER_SESSION_TOKEN=$(coder login token)
+```
+
 ### Session Durations
 
 By default, sessions last 24 hours and are automatically refreshed. You can
@@ -80,6 +95,24 @@ You can use the
 [`CODER_MAX_TOKEN_LIFETIME`](https://coder.com/docs/reference/cli/server#--max-token-lifetime)
 server flag to set the maximum duration for long-lived tokens in your
 deployment.
+
+### Remove or expire a token
+
+You can remove a token using the CLI or the API. By default, `coder tokens remove`
+expires the token, (soft-delete):
+
+```console
+coder tokens remove <name|id>
+```
+
+Expired tokens can no longer be used for authentication but remain visible in
+token listings.
+
+To hard-delete a token, use the `--delete` flag:
+
+```console
+coder tokens remove --delete <name|id>
+```
 
 ## API Key Scopes
 

@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	aiblib "github.com/coder/aibridge"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/db2sdk"
@@ -20,6 +21,7 @@ import (
 	"github.com/coder/coder/v2/enterprise/coderd/coderdenttest"
 	"github.com/coder/coder/v2/enterprise/coderd/license"
 	"github.com/coder/coder/v2/testutil"
+	"github.com/coder/serpent"
 )
 
 func TestAIBridgeListInterceptions(t *testing.T) {
@@ -51,6 +53,7 @@ func TestAIBridgeListInterceptions(t *testing.T) {
 	t.Run("EmptyDB", func(t *testing.T) {
 		t.Parallel()
 		dv := coderdtest.DeploymentValues(t)
+		dv.AI.BridgeConfig.Enabled = serpent.Bool(true)
 		client, _ := coderdenttest.New(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues: dv,
@@ -71,6 +74,7 @@ func TestAIBridgeListInterceptions(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
 		t.Parallel()
 		dv := coderdtest.DeploymentValues(t)
+		dv.AI.BridgeConfig.Enabled = serpent.Bool(true)
 		client, db, firstUser := coderdenttest.NewWithDatabase(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues: dv,
@@ -189,6 +193,7 @@ func TestAIBridgeListInterceptions(t *testing.T) {
 		t.Parallel()
 
 		dv := coderdtest.DeploymentValues(t)
+		dv.AI.BridgeConfig.Enabled = serpent.Bool(true)
 		client, db, firstUser := coderdenttest.NewWithDatabase(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues: dv,
@@ -304,6 +309,7 @@ func TestAIBridgeListInterceptions(t *testing.T) {
 	t.Run("InflightInterceptions", func(t *testing.T) {
 		t.Parallel()
 		dv := coderdtest.DeploymentValues(t)
+		dv.AI.BridgeConfig.Enabled = serpent.Bool(true)
 		client, db, firstUser := coderdenttest.NewWithDatabase(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues: dv,
@@ -337,6 +343,7 @@ func TestAIBridgeListInterceptions(t *testing.T) {
 	t.Run("Authorized", func(t *testing.T) {
 		t.Parallel()
 		dv := coderdtest.DeploymentValues(t)
+		dv.AI.BridgeConfig.Enabled = serpent.Bool(true)
 		adminClient, db, firstUser := coderdenttest.NewWithDatabase(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues: dv,
@@ -381,6 +388,7 @@ func TestAIBridgeListInterceptions(t *testing.T) {
 	t.Run("Filter", func(t *testing.T) {
 		t.Parallel()
 		dv := coderdtest.DeploymentValues(t)
+		dv.AI.BridgeConfig.Enabled = serpent.Bool(true)
 		client, db, firstUser := coderdenttest.NewWithDatabase(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues: dv,
@@ -426,6 +434,7 @@ func TestAIBridgeListInterceptions(t *testing.T) {
 			Provider:    "two",
 			Model:       "two",
 			StartedAt:   now.Add(-time.Hour),
+			Client:      sql.NullString{String: aiblib.ClientCursor, Valid: true},
 		}, &now)
 		i3 := dbgen.AIBridgeInterception(t, db, database.InsertAIBridgeInterceptionParams{
 			ID:          uuid.MustParse("00000000-0000-0000-0000-000000000003"),
@@ -433,6 +442,7 @@ func TestAIBridgeListInterceptions(t *testing.T) {
 			Provider:    "three",
 			Model:       "three",
 			StartedAt:   now.Add(-2 * time.Hour),
+			Client:      sql.NullString{String: aiblib.ClientClaude, Valid: true},
 		}, &now)
 
 		// Convert to SDK types for response comparison. We don't care about the
@@ -490,6 +500,21 @@ func TestAIBridgeListInterceptions(t *testing.T) {
 				name:   "Model/OK",
 				filter: codersdk.AIBridgeListInterceptionsFilter{Model: "three"},
 				want:   []codersdk.AIBridgeInterception{i3SDK},
+			},
+			{
+				name:   "Client/Unknown",
+				filter: codersdk.AIBridgeListInterceptionsFilter{Client: "Unknown"},
+				want:   []codersdk.AIBridgeInterception{i1SDK},
+			},
+			{
+				name:   "Client/Match",
+				filter: codersdk.AIBridgeListInterceptionsFilter{Client: aiblib.ClientCursor},
+				want:   []codersdk.AIBridgeInterception{i2SDK},
+			},
+			{
+				name:   "Client/NoMatch",
+				filter: codersdk.AIBridgeListInterceptionsFilter{Client: "nonsense"},
+				want:   []codersdk.AIBridgeInterception{},
 			},
 			{
 				name: "StartedAfter/NoMatch",
@@ -561,6 +586,7 @@ func TestAIBridgeListInterceptions(t *testing.T) {
 	t.Run("FilterErrors", func(t *testing.T) {
 		t.Parallel()
 		dv := coderdtest.DeploymentValues(t)
+		dv.AI.BridgeConfig.Enabled = serpent.Bool(true)
 		client, _ := coderdenttest.New(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues: dv,
@@ -643,6 +669,7 @@ func TestAIBridgeRouting(t *testing.T) {
 	t.Parallel()
 
 	dv := coderdtest.DeploymentValues(t)
+	dv.AI.BridgeConfig.Enabled = serpent.Bool(true)
 	client, closer, api, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
 		Options: &coderdtest.Options{
 			DeploymentValues: dv,
@@ -703,6 +730,7 @@ func TestAIBridgeRateLimiting(t *testing.T) {
 	t.Parallel()
 
 	dv := coderdtest.DeploymentValues(t)
+	dv.AI.BridgeConfig.Enabled = serpent.Bool(true)
 	// Set a low rate limit for testing.
 	dv.AI.BridgeConfig.RateLimit = 2
 
@@ -758,6 +786,7 @@ func TestAIBridgeConcurrencyLimiting(t *testing.T) {
 	t.Parallel()
 
 	dv := coderdtest.DeploymentValues(t)
+	dv.AI.BridgeConfig.Enabled = serpent.Bool(true)
 	// Set a low concurrency limit for testing.
 	dv.AI.BridgeConfig.MaxConcurrency = 1
 

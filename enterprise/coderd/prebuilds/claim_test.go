@@ -166,8 +166,17 @@ func TestClaimPrebuild(t *testing.T) {
 				defer provisionerCloser.Close()
 
 				cache := files.New(prometheus.NewRegistry(), &coderdtest.FakeAuthorizer{})
-				reconciler := prebuilds.NewStoreReconciler(spy, pubsub, cache, codersdk.PrebuildsConfig{}, logger, quartz.NewMock(t), prometheus.NewRegistry(), newNoopEnqueuer(), newNoopUsageCheckerPtr(), noop.NewTracerProvider())
-				var claimer agplprebuilds.Claimer = prebuilds.NewEnterpriseClaimer(spy)
+				reconciler := prebuilds.NewStoreReconciler(
+					spy, pubsub, cache, codersdk.PrebuildsConfig{}, logger,
+					quartz.NewMock(t),
+					prometheus.NewRegistry(),
+					newNoopEnqueuer(),
+					newNoopUsageCheckerPtr(),
+					noop.NewTracerProvider(),
+					10,
+					nil,
+				)
+				var claimer agplprebuilds.Claimer = prebuilds.NewEnterpriseClaimer()
 				api.AGPL.PrebuildsClaimer.Store(&claimer)
 
 				version := coderdtest.CreateTemplateVersion(t, client, orgID, templateWithAgentAndPresetsWithPrebuilds(desiredInstances))

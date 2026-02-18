@@ -4,7 +4,7 @@ AI Bridge runs inside the Coder control plane (`coderd`), requiring no separate 
 
 **Required**:
 
-1. A **premium** licensed Coder deployment
+1. A **Premium** license with the [AI Governance Add-On](../ai-governance.md).
 1. Feature must be [enabled](#activation) using the server flag
 1. One or more [providers](#configure-providers) API key(s) must be configured
 
@@ -13,7 +13,8 @@ AI Bridge runs inside the Coder control plane (`coderd`), requiring no separate 
 You will need to enable AI Bridge explicitly:
 
 ```sh
-CODER_AIBRIDGE_ENABLED=true coder server
+export CODER_AIBRIDGE_ENABLED=true
+coder server
 # or
 coder server --aibridge-enabled=true
 ```
@@ -57,6 +58,11 @@ Set the following when routing [Amazon Bedrock](https://coder.com/docs/reference
 - `CODER_AIBRIDGE_BEDROCK_ACCESS_KEY_SECRET` or `--aibridge-bedrock-access-key-secret`
 - `CODER_AIBRIDGE_BEDROCK_MODEL` or `--aibridge-bedrock-model`
 - `CODER_AIBRIDGE_BEDROCK_SMALL_FAST_MODEL` or `--aibridge-bedrock-small-fast-model`
+
+> [!NOTE]
+> `CODER_AIBRIDGE_BEDROCK_BASE_URL` or `--aibridge-bedrock-base-url` may be used instead of `CODER_AIBRIDGE_BEDROCK_REGION`/`--aibridge-bedrock-region`
+if you would like to specify a URL which does not follow the form of `https://bedrock-runtime.<region>.amazonaws.com` - for example if using a
+proxy between AI Bridge and AWS Bedrock.
 
 #### Obtaining Bedrock credentials
 
