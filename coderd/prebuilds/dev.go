@@ -33,6 +33,7 @@ func NewDevClaimer(store database.Store) *DevClaimer {
 
 func (c *DevClaimer) Claim(
 	ctx context.Context,
+	store database.Store,
 	now time.Time,
 	userID uuid.UUID,
 	name string,
@@ -41,7 +42,7 @@ func (c *DevClaimer) Claim(
 	nextStartAt sql.NullTime,
 	ttl sql.NullInt64,
 ) (*uuid.UUID, error) {
-	result, err := c.store.ClaimPrebuiltWorkspace(ctx, database.ClaimPrebuiltWorkspaceParams{
+	result, err := store.ClaimPrebuiltWorkspace(ctx, database.ClaimPrebuiltWorkspaceParams{
 		NewUserID:         userID,
 		NewName:           name,
 		Now:               now,
