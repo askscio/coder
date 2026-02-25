@@ -1,0 +1,67 @@
+# Helm values for deploying Coder with all premium features in development mode
+# Use this for testing premium features without a license
+#
+# Usage:
+#   helm install coder coder-v2/coder \
+#     --namespace coder \
+#     --values values-dev-premium.yaml
+
+coder:
+  image:
+    tag: "latest"
+    pullPolicy: Always
+
+  # Enable all premium features in development mode
+  env:
+    # Prebuilds - Pre-provision workspaces for faster startup
+    - name: CODER_DEV_PREBUILDS
+      value: "true"
+
+    # Audit Logs - Track all user operations and changes
+    - name: CODER_DEV_AUDIT_LOGS
+      value: "true"
+
+    # Connection Logs - Monitor workspace connections (SSH, IDE, apps)
+    - name: CODER_DEV_CONNECTION_LOGS
+      value: "true"
+
+    # Quotas - Credit-based workspace budgeting and spend control
+    - name: CODER_DEV_QUOTAS
+      value: "true"
+
+    # Disable telemetry for dev/testing
+    - name: CODER_TELEMETRY_ENABLE
+      value: "false"
+
+  # High Availability - Run multiple replicas for HA testing
+  # HA is automatically enabled when multiple instances connect to same DB
+  replicaCount: 2
+
+  # Resources for HA deployment
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2000m"
+      memory: "4Gi"
+
+# PostgreSQL configuration for HA and quota testing
+postgres:
+  enabled: true
+  primary:
+    persistence:
+      enabled: true
+      size: 10Gi
+
+  # Enable replication for HA testing (optional)
+  replication:
+    enabled: false
+    slaveReplicas: 1
+
+# Optional: Enable ingress for external access
+# ingress:
+#   enable: true
+#   host: "coder-dev.example.com"
+#   tls:
+#     enable: true

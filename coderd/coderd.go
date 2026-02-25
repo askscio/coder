@@ -89,6 +89,7 @@ import (
 	"github.com/coder/coder/v2/coderd/webpush"
 	"github.com/coder/coder/v2/coderd/workspaceapps"
 	"github.com/coder/coder/v2/coderd/workspaceapps/appurl"
+	"github.com/coder/coder/v2/coderd/workspacequota"
 	"github.com/coder/coder/v2/coderd/workspacestats"
 	"github.com/coder/coder/v2/coderd/wsbuilder"
 	"github.com/coder/coder/v2/codersdk"
@@ -672,6 +673,34 @@ func New(options *Options) *API {
 		api.PrebuildsClaimer.Store(&prebuilds.DefaultClaimer)
 		api.PrebuildsReconciler.Store(&prebuilds.DefaultReconciler)
 	}
+
+	// Enable dev mode for audit logs.
+	// Set CODER_DEV_AUDIT_LOGS=true to enable audit logging without a license.
+	if audit.DevModeEnabled() {
+		options.Logger.Warn(ctx, "audit logs development mode enabled - this is for testing only")
+		devAuditor := audit.Auditor(audit.NewDevAuditor())
+		api.Auditor.Store(&devAuditor)
+	}
+
+	// Enable dev mode for connection logs.
+	// Set CODER_DEV_CONNECTION_LOGS=true to enable connection logging without a license.
+	if connectionlog.DevModeEnabled() {
+		options.Logger.Warn(ctx, "connection logs development mode enabled - this is for testing only")
+		devConnectionLogger := connectionlog.ConnectionLogger(connectionlog.NewDevConnectionLogger())
+		api.ConnectionLogger.Store(&devConnectionLogger)
+	}
+
+	// Enable dev mode for quotas (Template RBAC).
+	// Set CODER_DEV_QUOTAS=true to enable quota functionality without a license.
+	if workspacequota.DevModeEnabled() {
+		options.Logger.Warn(ctx, "quotas development mode enabled - this is for testing only")
+		devQuotaCommitter := proto.QuotaCommitter(workspacequota.NewDevCommitter(
+			options.Logger.Named("quota_committer"),
+			options.Database,
+		))
+		api.QuotaCommitter.Store(&devQuotaCommitter)
+	}
+
 	buildInfo := codersdk.BuildInfoResponse{
 		ExternalURL:           buildinfo.ExternalURL(),
 		Version:               buildinfo.Version(),
